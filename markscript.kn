@@ -407,7 +407,7 @@ pub fn register_stdlib_handlers(vm: MarkScriptVM) -> MarkScriptVM:
     // --- Fix 1: Single-word aliases for all multi-word intents ---
     // These enable blockquote argument passing: > write "path" "content"
     v = register_handler(v, hash_name("write"), FN_FS_WRITE_TEXT)
-    // TEMP-BISECT disabled
+    v = register_handler(v, hash_name("write_region"), FN_FS_WRITE_REGION)
     v = register_handler(v, hash_name("read"), FN_FS_READ_TEXT)
     v = register_handler(v, hash_name("exists"), FN_FS_EXISTS)
     v = register_handler(v, hash_name("import"), FN_IMPORT_KAIN)
@@ -8829,6 +8829,12 @@ pub fn get_widget_prop(vm: MarkScriptVM, handle: Int, prop_name: String) -> Mark
 // ===========================================================================
 
 fn add_values(a: MarkValue, b: MarkValue) -> MarkValue:
+    // String concatenation: if either side is a string, stringify both.
+    // (Without this, "a" + "b" silently yields 0 — the verify-section zeros.)
+    if a.kind == MARK_STRING:
+        return mark_string(a.str_val + mark_value_to_string(b))
+    if b.kind == MARK_STRING:
+        return mark_string(mark_value_to_string(a) + b.str_val)
     if a.kind == MARK_INT and b.kind == MARK_INT:
         return mark_int(a.int_val + b.int_val)
     elif a.kind == MARK_FLOAT and b.kind == MARK_FLOAT:

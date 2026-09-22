@@ -24,6 +24,7 @@ Asserts are silent on pass — `Handler error` lines are real failures.
 | 06_jit_brutal (jit-run) | hangs (blocked, ~0 CPU) | ❌ Content-specific: sections/pairs/triples/padded loops all instant; full 436-op file parks. Pre-existing JIT driver issue, needs a native-debug session |
 | 07_fuzz_corpus | exit 0 | ✅ Unclosed fence, nested quotes, adversarial nesting all survive. No crash, no hang |
 | 08_operators | exit 0, **17/17 correct** | ✅ elif/==/!=/</<=/>/>=/%, while-<= all exact |
+| fizzbuzz (full file) | 211 lines: 100 prove + 5 verify + 106 doc-fence | ✅ prove exact 6/27/14/53; verify prints real counts (doc expectations wrong); doc pseudo-fences execute by design |
 | `jit` selftest | all op emitters OK | ✅ JIT backend alive |
 | `repl` / `eval` / `pipe` | canned demo / nothing-to-execute / silent | ❌ Stubs. Files (`run`) are the only working execution path |
 
@@ -52,6 +53,18 @@ segfaulted on empty arrays).
 
 **Fix E — `08_operators.md`** regression file: 17 PRINT expectations,
 all green.
+
+**Fix F — string `+` concatenation.** `add_values` returned `mark_int(0)`
+when either side was a string, so every `"a" + x` printed `0` (the five
+verify-section zeros). String arm added: either side MARK_STRING →
+concatenate string forms.
+
+**Docs-vs-engine verdict (fizzbuzz).** With branches, modulo, strings,
+and concat all working, the engine now audits its own documentation:
+the file's claimed counts (14/27/20/39) are wrong — the machine says
+6/27/14/53, total 100. Trust the machine. (Also: the `how_it_works`
+section contains illustrative pseudo-fences that now EXECUTE — fences
+are code, always. Pseudocode belongs in non-markscript fences.)
 
 ## Diagnosed, NOT yet fixed (precise mechanisms, repros included)
 
