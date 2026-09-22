@@ -132,30 +132,48 @@ stack-residue `"0 "` prefix on fence prints (`0 PASS mul`,
 `0 OMEGA-ALPHA COMPLETE`) — windowed args shed residue, raw values pass
 through untouched. OMEGA output is byte-clean.
 
-## New findings (open)
+**Fix H — quote parity.** The compile-side outer-quote strip inverted
+`split_blockquote_string` parity for multi-quoted lines (verified by
+tracing: `"A" "B C"` split into 11 fragments). Strip removed; splitter
+handles fully-quoted input correctly. `write_region` splices perfectly.
 
-**F11 — string `+` concat yields residue.** `print("hello" + " " + "world")`
-→ `[PRINT] 0`. `str()`, plain prints, var reads, `==` all fine (OMEGA §06
-is green on those). Repro: standalone fence, any `+` on strings.
+**Fix I — CRLF normalization at ingest.** `read_source` maps CRLF/CR to
+LF once, centrally — stray `\r` bytes poisoned tokenizers, splitters,
+and sentinels (CRLF vs LF runs diverged). Windows checkouts now behave
+identically.
+
+**Fix J — split normalization.** Single-part split results were discarded,
+keeping quotes (`"BOOT"` printed with quotes). Always normalize through
+the splitter.
+
+**Fix K — string `+` concat (F11).** `add_values` returned `mark_int(0)`
+when either side was a string. String arm added; `print("hello" + " " +
+"world")` works.
+
+**Fix L — intent result POP.** Intent calls never emitted the `OP_POP_STACK`
+that fence calls get, so handler results lingered into the next dispatch
+as phantom args. One-line emit fix.
+
+**Fix M — unary minus (F13).** `ms_parse_factor` silently dropped leading
+`-`, so `== -2` compared against garbage. `0 - x` lowering added.
+
+## New findings (open)
 
 **F12 — `--section` slices wrong.** `run --section <routine>` reports a
 tiny op window (32 ops for a ~200-op routine) and executes only the first
 dispatch; `disasm --section` ignores the flag entirely (dumps all ops).
 Full runs are the supported path until the slicer remaps jumps.
 
-**F13 — negative literal as comparison RHS fails.** `if 0 - 5 + 3 == -2`
-takes else; `== 0 - 2` passes. Arithmetic on negatives is fine (prints -2);
-only the literal in the finder is blind. OMEGA §01 uses the `0 - 2` form.
-
 ## Shipped-but-not-mine (pre-existing working-copy WIP, kept as found)
 
 The tree held uncommitted work when this session started: a `write_region`
 intent (registry row 81 + full handler + dispatch + exe-dir registry
 candidates + loud missing-registry warning + `handlers` name resolution).
-Kept, with two leftover `[DBG]` printlns removed. Status: builds clean,
-dispatches fn_id=81 with success — **but the splice lands in the wrong
-place** (arg split shifts content; verified against a sentinel probe).
-Treat `write_region` as EXPERIMENTAL until its author covers it. Related
-caveat: the exe-dir registry candidate can load a STALE `std/intents.md`
-that happens to sit beside the binary (seen: 72-row copy shadowing the
-73-row repo file). Ship assets alone, not beside old checkouts.
+Kept, with two leftover `[DBG]` printlns removed. Status as of this
+release: **PROMOTED — splice verified perfect** (sentinels preserved,
+tail intact, loud errors on missing file/sentinels). The arg-parity bug
+it shipped with (outer-quote strip inverting the splitter) is fixed —
+see Fix I below. Related caveat: the exe-dir registry candidate can load
+a STALE `std/intents.md` that happens to sit beside the binary (seen:
+72-row copy shadowing the 73-row repo file). Ship assets alone, not
+beside old checkouts.

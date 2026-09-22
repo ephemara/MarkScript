@@ -2335,8 +2335,11 @@ fn decode_and_split_args(args: Array<MarkValue>) -> Array<MarkValue>:
     // `len==1 and decoded[0]` indexes an empty array when decoded is [].
     if len(decoded) == 1:
         if decoded[0].kind == MARK_STRING:
+            # Always normalize through the splitter (not just multi-part):
+            # a single quoted arg must come back unquoted, and unquoted
+            # spacing must collapse the same way multi-arg does.
             let parts = split_blockquote_string(decoded[0].str_val)
-            if len(parts) > 1:
+            if len(parts) >= 1:
                 var split_args: Array<MarkValue> = []
                 var pi: Int = 0
                 while pi < len(parts):
@@ -4843,7 +4846,23 @@ use registry        // load_registry, is_loaded, keyword_count, get_error
 // ===========================================================================
 
 fn read_source(path: String) -> String:
-    return fs_read_text(path)
+    let raw = fs_read_text(path)
+    // Normalize line endings once, centrally: CRLF/CR -> LF.
+    // Stray \r bytes otherwise poison tokenizers, splitters, conditions
+    // and sentinels downstream (Windows checkouts use CRLF).
+    var text: String = ""
+    var i: Int = 0
+    while i < len(raw):
+        let ch = text_substring_string(raw, i, 1)
+        if ch == "\r":
+            text = text + "\n"
+            if i + 1 < len(raw):
+                if text_substring_string(raw, i + 1, 1) == "\n":
+                    i = i + 1
+        else:
+            text = text + ch
+        i = i + 1
+    return text
 
 // ===========================================================================
 //  REGISTRY LOADING — loads the intent keyword registry data file
@@ -6896,6 +6915,13 @@ fn ms_parse_factor(tokens: Array<MSToken>, pos: Int, bc: Array<Int>) -> Int:
     if pos >= len(tokens):
         return pos
     let tok = tokens[pos]
+    if tok.kind == MS_TOK_MINUS:
+        // Unary minus: 0 - x (was silently dropped, breaking `== -2`).
+        push(bc, OP_PUSH_STACK)
+        push(bc, 0)
+        let p = ms_parse_factor(tokens, pos + 1, bc)
+        push(bc, OP_SUB)
+        return p
     if tok.kind == MS_TOK_INT:
         let ival = ms_parse_int(tok.text)
         push(bc, OP_PUSH_STACK)
@@ -7618,6 +7644,10 @@ pub fn parse_source(state: LexerState) -> Array<Int>:
             push(bc, OP_PUSH_PARAM)
             push(bc, intent_hash)
             push(bc, OP_EXECUTE_CALL)
+            // Pop the handler result like in-fence calls do — without this,
+            // results linger on the stack and ride into the NEXT dispatch
+            // as phantom leading args (the "0 " prefix class of bug).
+            push(bc, OP_POP_STACK)
 
         elif kind == TOK_TABLEPIPE:
             let tresult = parse_matrix_table(s, next_handle)
