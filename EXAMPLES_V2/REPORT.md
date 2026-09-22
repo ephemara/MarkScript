@@ -94,3 +94,55 @@ errors on input `build` compiles cleanly. Build, don't check.
 
 No `../std/intents.md` beside the input → exe falls back to 95 embedded
 handlers and runs. Registry file is enhancement, not requirement.
+
+---
+
+# OMEGA_ALPHA session (v1.0.3) — the god-file + two engine fixes
+
+**File:** `OMEGA_ALPHA.md` (repo root). One document exercising every
+feature: prose-skipping, 9 markscript fences (arithmetic, elif/all-six
+comparisons, 3-deep nesting, fib30/collatz/primes/100k-spin/triple loops,
+full FizzBuzz 1–100 + self-count, strings, 2 data matrices, kain/python/rust
+vault fences, break-me abuse, unknown-intent survival), 11 blockquote
+intents, final receipt. **Result: 155 dispatches, 0 failed, 0 FAIL lines,
+32 PASS lines, `receipt=PASS`.** FizzBuzz counts exact (27/14/6).
+
+## Fixed in this release (verified live)
+
+**Fix F — dispatch cap 100 → 100000** (`run_handler_loop`, `cmd_pipe`,
+`cmd_watch` loops). The old cap cut any file with >100 prints mid-stream
+(OMEGA's rite alone spends 100). Safety limit retained, god-files run whole.
+
+**Fix G — `handler_println` now decodes args** via
+`decode_count_bytes_args` before space-joining. Killed the cross-dispatch
+stack-residue `"0 "` prefix on fence prints (`0 PASS mul`,
+`0 OMEGA-ALPHA COMPLETE`) — windowed args shed residue, raw values pass
+through untouched. OMEGA output is byte-clean.
+
+## New findings (open)
+
+**F11 — string `+` concat yields residue.** `print("hello" + " " + "world")`
+→ `[PRINT] 0`. `str()`, plain prints, var reads, `==` all fine (OMEGA §06
+is green on those). Repro: standalone fence, any `+` on strings.
+
+**F12 — `--section` slices wrong.** `run --section <routine>` reports a
+tiny op window (32 ops for a ~200-op routine) and executes only the first
+dispatch; `disasm --section` ignores the flag entirely (dumps all ops).
+Full runs are the supported path until the slicer remaps jumps.
+
+**F13 — negative literal as comparison RHS fails.** `if 0 - 5 + 3 == -2`
+takes else; `== 0 - 2` passes. Arithmetic on negatives is fine (prints -2);
+only the literal in the finder is blind. OMEGA §01 uses the `0 - 2` form.
+
+## Shipped-but-not-mine (pre-existing working-copy WIP, kept as found)
+
+The tree held uncommitted work when this session started: a `write_region`
+intent (registry row 81 + full handler + dispatch + exe-dir registry
+candidates + loud missing-registry warning + `handlers` name resolution).
+Kept, with two leftover `[DBG]` printlns removed. Status: builds clean,
+dispatches fn_id=81 with success — **but the splice lands in the wrong
+place** (arg split shifts content; verified against a sentinel probe).
+Treat `write_region` as EXPERIMENTAL until its author covers it. Related
+caveat: the exe-dir registry candidate can load a STALE `std/intents.md`
+that happens to sit beside the binary (seen: 72-row copy shadowing the
+73-row repo file). Ship assets alone, not beside old checkouts.

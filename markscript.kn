@@ -100,6 +100,7 @@ use parser      // hash_name
 pub const FN_FS_READ_TEXT:     Int = 1
 pub const FN_FS_WRITE_TEXT:    Int = 2
 pub const FN_FS_EXISTS:        Int = 3
+pub const FN_FS_WRITE_REGION:  Int = 81
 pub const FN_PROCESS_OUTPUT:   Int = 4
 pub const FN_PROCESS_SPAWN:    Int = 5
 pub const FN_IMPORT_KAIN:      Int = 6
@@ -406,6 +407,7 @@ pub fn register_stdlib_handlers(vm: MarkScriptVM) -> MarkScriptVM:
     // --- Fix 1: Single-word aliases for all multi-word intents ---
     // These enable blockquote argument passing: > write "path" "content"
     v = register_handler(v, hash_name("write"), FN_FS_WRITE_TEXT)
+    // TEMP-BISECT disabled
     v = register_handler(v, hash_name("read"), FN_FS_READ_TEXT)
     v = register_handler(v, hash_name("exists"), FN_FS_EXISTS)
     v = register_handler(v, hash_name("import"), FN_IMPORT_KAIN)
@@ -584,6 +586,91 @@ fn handler_fs_write_text(vm: MarkScriptVM, args: Array<MarkValue>) -> HandlerRes
 
 // --- handler_fs_exists — "file exists" intent -----------------------------
 // args[0] = file path (string)
+// --- handler_fs_write_region — "write_region" intent -----------------------
+// args: filepath, begin-sentinel, end-sentinel, content...
+// Replaces the lines strictly between the first line containing
+// begin-sentinel and the first following line containing end-sentinel.
+// Missing file/sentinels are ERRORS (never silent). Content parts beyond
+// the third arg are joined with single spaces (quote multi-word content).
+// Returns 1 on success. Makes living documents safe by construction.
+fn handler_fs_write_region(vm: MarkScriptVM, args: Array<MarkValue>) -> HandlerResult:
+    if len(args) < 4:
+        return HandlerResult {
+            vm: vm,
+            value: mark_int(0),
+            err: "write_region: need filepath, begin, end, content"
+        }
+    let path = mark_value_to_string(args[0])
+    let begin_mark = mark_value_to_string(args[1])
+    let end_mark = mark_value_to_string(args[2])
+    var content: String = mark_value_to_string(args[3])
+    var ci: Int = 4
+    while ci < len(args):
+        content = content + " " + mark_value_to_string(args[ci])
+        ci = ci + 1
+    if path == "":
+        return HandlerResult {
+            vm: vm,
+            value: mark_int(0),
+            err: "write_region: no path provided"
+        }
+    if begin_mark == "" or end_mark == "":
+        return HandlerResult {
+            vm: vm,
+            value: mark_int(0),
+            err: "write_region: begin/end sentinels must be non-empty"
+        }
+    if fs_exists(path) == false:
+        return HandlerResult {
+            vm: vm,
+            value: mark_int(0),
+            err: "write_region: file not found: " + path
+        }
+    let source = fs_read_text(path)
+    let lines = split_lines(source)
+    var bi: Int = 0
+    var begin_at: Int = -1
+    while bi < len(lines):
+        if text_contains_string(lines[bi], begin_mark):
+            begin_at = bi
+            bi = len(lines)
+        bi = bi + 1
+    if begin_at < 0:
+        return HandlerResult {
+            vm: vm,
+            value: mark_int(0),
+            err: "write_region: begin sentinel not found: " + begin_mark
+        }
+    var ei: Int = begin_at + 1
+    var end_at: Int = -1
+    while ei < len(lines):
+        if text_contains_string(lines[ei], end_mark):
+            end_at = ei
+            ei = len(lines)
+        ei = ei + 1
+    if end_at < 0:
+        return HandlerResult {
+            vm: vm,
+            value: mark_int(0),
+            err: "write_region: end sentinel not found: " + end_mark
+        }
+    var result: String = ""
+    var li: Int = 0
+    while li <= begin_at:
+        result = result + lines[li] + "\n"
+        li = li + 1
+    result = result + content + "\n"
+    li = end_at
+    while li < len(lines):
+        result = result + lines[li] + "\n"
+        li = li + 1
+    fs_write_text(path, result)
+    return HandlerResult {
+        vm: vm,
+        value: mark_int(1),
+        err: ""
+    }
+
 fn handler_fs_exists(vm: MarkScriptVM, args: Array<MarkValue>) -> HandlerResult:
     var path: String = ""
     if len(args) > 0:
@@ -773,14 +860,17 @@ fn handler_assert(vm: MarkScriptVM, args: Array<MarkValue>) -> HandlerResult:
 // args[0] = value to print
 fn handler_println(vm: MarkScriptVM, args: Array<MarkValue>) -> HandlerResult:
     // Print ALL args space-joined (intent tokenizers split quoted strings).
+    // Decoded first: strips cross-dispatch stack residue (the "0 " prefix)
+    // when count+bytes windows are present; raw in-fence values pass through.
+    let clean = decode_count_bytes_args(args)
     var msg: String = ""
     var pi: Int = 0
-    while pi < len(args):
+    while pi < len(clean):
         if pi > 0:
             msg = msg + " "
-        msg = msg + mark_value_to_string(args[pi])
+        msg = msg + mark_value_to_string(clean[pi])
         pi = pi + 1
-    if len(args) > 0:
+    if len(clean) > 0:
         println("[PRINT] " + msg)
     return HandlerResult {
         vm: vm,
@@ -2271,6 +2361,8 @@ pub fn dispatch_fn(vm: MarkScriptVM, fn_id: Int, args: Array<MarkValue>) -> Hand
         hr = handler_fs_read_text(vm, norm_args)
     elif fn_id == FN_FS_WRITE_TEXT:
         hr = handler_fs_write_text(vm, norm_args)
+    elif fn_id == FN_FS_WRITE_REGION:
+        hr = handler_fs_write_region(vm, norm_args)
     elif fn_id == FN_FS_EXISTS:
         hr = handler_fs_exists(vm, norm_args)
     elif fn_id == FN_PROCESS_OUTPUT:
@@ -4779,6 +4871,15 @@ fn load_intent_registry(source_filepath: String) -> Bool:
             push(candidates, base + "/intents.md")
             push(candidates, base + "/../std/intents.md")
 
+    // Portable installs: the binary's own home (exe-dir), so campaigns
+    // run from any CWD without a registry checkout beside the input.
+    let exe_path = process_current_executable_path()
+    if exe_path != "":
+        let exe_base = fs_path_parent(exe_path)
+        if exe_base != "":
+            push(candidates, exe_base + "/std/intents.md")
+            push(candidates, exe_base + "/../std/intents.md")
+
     // Try each candidate
     var ci = 0
     while ci < len(candidates):
@@ -4794,8 +4895,15 @@ fn load_intent_registry(source_filepath: String) -> Bool:
                     println("[REGISTRY] Warning: " + err)
         ci = ci + 1
 
-    // No registry file found — proceed without intents
-    // All blockquotes will be treated as prose.
+    // No registry file found — warn LOUDLY. Silent prose-degradation
+    // looks exactly like success (exit 0, "No pending handlers") and has
+    // burned campaigns before. Never proceed quietly here.
+    println("[REGISTRY] WARNING: no intent registry found — tried:")
+    var wi2: Int = 0
+    while wi2 < len(candidates):
+        println("[REGISTRY]   - " + candidates[wi2])
+        wi2 = wi2 + 1
+    println("[REGISTRY] All blockquotes will be treated as prose. Only embedded handlers active.")
     return false
 
 // ===========================================================================
@@ -4971,7 +5079,7 @@ fn run_handler_loop(vm: MarkScriptVM, bc: Array<Int>, er: ExecResult) -> Int:
     var iteration: Int = 0
     var succeeded: Int = 0
     var failed: Int = 0
-    let max_iterations: Int = 100  // safety limit
+    let max_iterations: Int = 100000  // safety limit (raised for god-files: fizzbuzz-100 + suites)
 
     while current_er.handler_id > 0 and iteration < max_iterations:
         let fn_id = current_er.handler_id
@@ -5629,6 +5737,13 @@ fn cmd_handlers() -> Int:
 
     let vm = init_vm_with_builtins()
 
+    // Best-effort registry load so hashes resolve to keyword names.
+    // NOTE: read IntentRegistry (file-loaded), NOT ParserState.intent_*
+    // (those only fill during markdown compilation).
+    let reg_ok = load_intent_registry("")
+    let reg_phrases = IntentRegistry.keywords
+    let reg_hashes = IntentRegistry.keyword_hashes
+
     println("Registered handlers (" + str(vm.ivt_count) + "):")
     println("")
 
@@ -5636,12 +5751,27 @@ fn cmd_handlers() -> Int:
     while i < vm.ivt_count:
         let phrase = vm.ivt_phrases[i]
         let hid = vm.ivt_handler_ids[i]
-        println("  " + str(hid) + ": hash=" + str(phrase))
+        var kw: String = ""
+        if reg_ok:
+            var ri: Int = 0
+            while ri < len(reg_hashes):
+                if reg_hashes[ri] == phrase:
+                    if ri < len(reg_phrases):
+                        kw = reg_phrases[ri]
+                    ri = len(reg_hashes)
+                ri = ri + 1
+        if kw != "":
+            println("  " + str(hid) + ": " + kw)
+        else:
+            println("  " + str(hid) + ": hash=" + str(phrase))
         i = i + 1
 
     println("")
-    println("Note: IVT entries store hashed phrases for fast dispatch.")
-    println("The bridge translates handler_id to Kain stdlib calls.")
+    if reg_ok:
+        println("Names resolved from the intent registry.")
+    else:
+        println("Note: registry unavailable — showing raw phrase hashes.")
+        println("The bridge translates handler_id to Kain stdlib calls.")
     println("")
     println("=== HANDLER REGISTRY COMPLETE ===")
     return 0
@@ -5814,7 +5944,7 @@ fn cmd_pipe(cfg: MksConfig) -> Int:
         var current_vm = er.vm
         var current_er = er
         var iteration: Int = 0
-        let max_iter: Int = 100
+        let max_iter: Int = 100000  // raised for god-files (see run_handler_loop)
         while current_er.handler_id > 0 and iteration < max_iter:
             let fn_id = current_er.handler_id
             var args: Array<MarkValue> = []
@@ -6027,7 +6157,7 @@ fn cmd_build(cfg: MksConfig) -> Int:
             var current_vm = er.vm
             var current_er = er
             var iteration: Int = 0
-            let max_iter: Int = 100
+            let max_iter: Int = 100000  // raised for god-files (see run_handler_loop)
             while current_er.handler_id > 0 and iteration < max_iter:
                 let fn_id = current_er.handler_id
                 var args: Array<MarkValue> = []
@@ -7471,13 +7601,11 @@ pub fn parse_source(state: LexerState) -> Array<Int>:
             parser_intents_record(intent_word, intent_hash)
 
             // Push argument bytes to VM stack (count-prefixed for handler reconstruction)
+            // NOTE: do NOT strip outer quotes here. split_blockquote_string
+            // tracks quote parity from the first character; pre-stripped
+            // input inverts parity for the whole line. The splitter handles
+            // fully-quoted input correctly on its own.
             if rest_text != "":
-                // Strip surrounding quotes if present
-                if len(rest_text) >= 2:
-                    let fc = text_substring_string(rest_text, 0, 1)
-                    let lc = text_substring_string(rest_text, len(rest_text) - 1, 1)
-                    if (fc == "\"" and lc == "\"") or (fc == "'" and lc == "'"):
-                        rest_text = text_substring_string(rest_text, 1, len(rest_text) - 2)
                 let byte_count = len(rest_text)
                 push(bc, OP_PUSH_STACK)
                 push(bc, byte_count)
