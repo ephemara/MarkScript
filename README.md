@@ -3,7 +3,8 @@
 > **Your documentation is your program. Your README IS the executable.**
 
 MarkScript is a **markdown-native bytecode VM** that serves as Kain's companion language for configuration, orchestration, UI scripting, build systems, and executable documentation. It compiles through Kain's LLVM backend to native code - a standalone `.exe` with zero runtime dependencies beyond the Kain native runtime.
-*Note Markscript is not exclusive to being used only with Kain, it works standalone as well. (however was initially made as a companion language for Kain)
+
+Note: MKS is not exclusive to being used only with Kain, it works standalone as well. (however was initially made as a companion language for Kain)
 
 **Core property:** Markdown has no syntax errors. Every `#`, `>`, `|`, and `` ``` `` is valid. The only errors are *runtime* errors - name not found, arity mismatch, bounds violation, import failure.
 
