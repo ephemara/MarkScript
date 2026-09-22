@@ -2115,18 +2115,53 @@ fn looks_like_float(s: String) -> Bool:
         i = i + 1
     return has_dot and has_digit
 
+fn is_arg_window(args: Array<MarkValue>, i: Int) -> Bool:
+    // A valid count+bytes window opens at i: MARK_INT count>0 followed by
+    // exactly `count` printable-byte INTs inside the array bounds.
+    if i < 0 or i >= len(args):
+        return false
+    if args[i].kind != MARK_INT:
+        return false
+    let count = args[i].int_val
+    if count <= 0:
+        return false
+    var bi: Int = 0
+    while bi < count:
+        if (i + 1 + bi) >= len(args):
+            return false
+        if args[i + 1 + bi].kind != MARK_INT:
+            return false
+        if is_printable_byte(args[i + 1 + bi].int_val) == false:
+            return false
+        bi = bi + 1
+    return true
+
 fn decode_count_bytes_args(args: Array<MarkValue>) -> Array<MarkValue>:
     var decoded: Array<MarkValue> = []
     var i: Int = 0
+    // Two arg shapes reach this decoder. Blockquote intents arrive as
+    // trailing count+bytes windows, possibly preceded by stack residue —
+    // skip everything before the first window. In-fence calls arrive as
+    // RAW values with no windows at all — pass those through untouched.
+    var si: Int = 0
+    var has_window: Bool = false
+    while si < len(args):
+        if is_arg_window(args, si):
+            has_window = true
+            si = len(args)
+        si = si + 1
+    if has_window == false:
+        return args
+    var started: Bool = false
     while i < len(args):
         // Check for count+bytes pattern at position i
         var is_count_bytes: Bool = false
         if args[i].kind == MARK_INT:
             let count = args[i].int_val
-            if count > 0 and (i + count) < len(args):
+            if is_arg_window(args, i):
                 var all_bytes: Bool = true
                 var bi: Int = 0
-                while bi < count:
+                while bi < count and (i + 1 + bi) < len(args):
                     if args[i + 1 + bi].kind != MARK_INT:
                         all_bytes = false
                         bi = count
@@ -2134,7 +2169,8 @@ fn decode_count_bytes_args(args: Array<MarkValue>) -> Array<MarkValue>:
                         all_bytes = false
                         bi = count
                     bi = bi + 1
-                if all_bytes:
+                if bi == count:
+                    started = true
                     is_count_bytes = true
                     // Reconstruct string from byte values
                     var byte_arr: Array<Int> = []
@@ -2150,8 +2186,10 @@ fn decode_count_bytes_args(args: Array<MarkValue>) -> Array<MarkValue>:
                     // Advance past count + N byte values
                     i = i + 1 + count
         if is_count_bytes == false:
-            // Not a count+bytes sequence — pass through raw value
-            push(decoded, args[i])
+            // Not a count+bytes sequence — pass through raw value,
+            // unless we haven't seen the first window yet (residue).
+            if started:
+                push(decoded, args[i])
             i = i + 1
     return decoded
 
@@ -2203,16 +2241,19 @@ fn decode_and_split_args(args: Array<MarkValue>) -> Array<MarkValue>:
     // First decode count+bytes, then split single strings if they appear to
     // contain multiple quoted/space-separated arguments
     let decoded = decode_count_bytes_args(args)
-    if len(decoded) == 1 and decoded[0].kind == MARK_STRING:
-        let parts = split_blockquote_string(decoded[0].str_val)
-        if len(parts) > 1:
-            var split_args: Array<MarkValue> = []
-            var pi: Int = 0
-            while pi < len(parts):
-                // Keep as strings — float_val doesn't survive Array passthrough
-                push(split_args, mark_string(parts[pi]))
-                pi = pi + 1
-            return split_args
+    // NOTE: nested ifs, NOT `and` — Kain `and` does not short-circuit, so
+    // `len==1 and decoded[0]` indexes an empty array when decoded is [].
+    if len(decoded) == 1:
+        if decoded[0].kind == MARK_STRING:
+            let parts = split_blockquote_string(decoded[0].str_val)
+            if len(parts) > 1:
+                var split_args: Array<MarkValue> = []
+                var pi: Int = 0
+                while pi < len(parts):
+                    // Keep as strings — float_val doesn't survive Array passthrough
+                    push(split_args, mark_string(parts[pi]))
+                    pi = pi + 1
+                return split_args
     return decoded
 
 // ===========================================================================
@@ -3729,6 +3770,21 @@ fn emit_div_rbp(arr: Array<Int>, rsp_off: Int) -> Array<Int>:
     emit_mov_rbp_disp(arr, 0, -8 - (rsp_off - 16), true)
     return arr
 
+fn emit_mod_rbp(arr: Array<Int>, rsp_off: Int) -> Array<Int>:
+    // x86 IDIV remainder: identical setup to emit_div_rbp, but the result
+    // stored back is RDX (remainder) instead of RAX (quotient).
+    // Same contract: caller guarantees a 16-byte shadow region and a
+    // nonzero divisor (VM traps div-by-zero before JIT regions matter).
+    emit_rr(arr, X64_REX_W, 0x31, 2, 2)                     // xor rdx, rdx
+    emit_mov_rbp_disp(arr, 3, -8 - (rsp_off - 8), false)    // mov rbx, [top-1]
+    emit_mov_rbp_disp(arr, 0, -8 - (rsp_off - 16), false)   // mov rax, [top-2]
+    // div rbx (rax = quotient, rdx = remainder)
+    push(arr, X64_REX_W)
+    push(arr, 0xF7)
+    push(arr, 0xF3)
+    emit_mov_rbp_disp(arr, 2, -8 - (rsp_off - 16), true)    // mov [top-2], rdx
+    return arr
+
 // ===========================================================================
 //  JUMP OPS — two-pass with fixup table
 //
@@ -3988,6 +4044,13 @@ pub fn jit_compile_block(bytecode: Array<Int>, start_ip: Int, end_ip: Int) -> Ji
                 rsp_offset = rsp_offset - 8
             ip = ip + 1
 
+        // ── OP_MOD (26) — a % b ─────────────────────────────────────
+        elif op == 26:
+            if rsp_offset >= 16:
+                code_arr = emit_mod_rbp(code_arr, rsp_offset)
+                rsp_offset = rsp_offset - 8
+            ip = ip + 1
+
         // ── OP_LOAD_VAR (18) — load variable by index ───────────────
         elif op == 18:
             ip = ip + 1
@@ -4223,6 +4286,10 @@ pub fn jit_selftest() -> Int with Unsafe:
 
     // Test 5: 100/5=20
     if run_jit_test("100/5", [7, 100, 7, 5, 17, 0], 20) != 0:
+        return 1
+
+    // Test 5b: 100%7=2 (OP_MOD mirrors DIV, stores RDX)
+    if run_jit_test("100%7", [7, 100, 7, 7, 26, 0], 2) != 0:
         return 1
 
     // Test 6: dup + pop
@@ -4754,6 +4821,7 @@ fn opcode_name(op: Int) -> String:
     elif op == OP_SUB:          return "OP_SUB"
     elif op == OP_MUL:          return "OP_MUL"
     elif op == OP_DIV:          return "OP_DIV"
+    elif op == OP_MOD:          return "OP_MOD"
     elif op == OP_LOAD_VAR:     return "OP_LOAD_VAR"
     elif op == OP_STORE_VAR:    return "OP_STORE_VAR"
     elif op == OP_JN:           return "OP_JN"
@@ -4779,6 +4847,7 @@ fn is_no_operand_op(op: Int) -> Bool:
     if op == OP_SUB: return true
     if op == OP_MUL: return true
     if op == OP_DIV: return true
+    if op == OP_MOD: return true
     if op == OP_ERROR_BOUNDARY: return true
     return false
 
@@ -6469,6 +6538,11 @@ const MS_TOK_RPAREN: Int = 15
 const MS_TOK_COMMA:  Int = 16
 const MS_TOK_COLON:  Int = 17
 const MS_TOK_EOF_MS: Int = 18
+const MS_TOK_ELIF:   Int = 19
+const MS_TOK_NEQ:    Int = 20
+const MS_TOK_LTE:    Int = 21
+const MS_TOK_GTE:    Int = 22
+const MS_TOK_MOD:    Int = 23
 
 struct MSToken:
     kind: Int
@@ -6604,6 +6678,17 @@ fn tokenize_ms_line(ln: String) -> Array<MSToken>:
             push(tokens, ms_token_make(MS_TOK_SLASH, "/"))
             pos = pos + 1
             continue
+        if ch == "!":
+            if pos + 1 < slen and text_substring_string(ln, pos + 1, 1) == "=":
+                push(tokens, ms_token_make(MS_TOK_NEQ, "!="))
+                pos = pos + 2
+                continue
+            pos = pos + 1
+            continue
+        if ch == "%":
+            push(tokens, ms_token_make(MS_TOK_MOD, "%"))
+            pos = pos + 1
+            continue
         if ch == "=":
             push(tokens, ms_token_make(MS_TOK_EQ, "="))
             pos = pos + 1
@@ -6665,6 +6750,8 @@ fn tokenize_ms_line(ln: String) -> Array<MSToken>:
                 push(tokens, ms_token_make(MS_TOK_IF, ident_text))
             elif ident_text == "else":
                 push(tokens, ms_token_make(MS_TOK_ELSE, ident_text))
+            elif ident_text == "elif":
+                push(tokens, ms_token_make(MS_TOK_ELIF, ident_text))
             else:
                 push(tokens, ms_token_make(MS_TOK_IDENT, ident_text))
             continue
@@ -6714,14 +6801,16 @@ fn ms_parse_term(tokens: Array<MSToken>, pos: Int, bc: Array<Int>) -> Int:
         if p >= len(tokens):
             break
         let tok = tokens[p]
-        if tok.kind == MS_TOK_STAR or tok.kind == MS_TOK_SLASH:
+        if tok.kind == MS_TOK_STAR or tok.kind == MS_TOK_SLASH or tok.kind == MS_TOK_MOD:
             let op_kind = tok.kind
             p = p + 1
             p = ms_parse_factor(tokens, p, bc)
             if op_kind == MS_TOK_STAR:
                 push(bc, OP_MUL)
-            else:
+            elif op_kind == MS_TOK_SLASH:
                 push(bc, OP_DIV)
+            else:
+                push(bc, OP_MOD)
         else:
             break
     return p
@@ -6793,15 +6882,27 @@ struct CompInfo:
     has_comp: Bool
     op_kind:  Int
     op_pos:   Int
+    op_len:   Int
 
 fn find_comparison(tokens: Array<MSToken>, start: Int, end: Int) -> CompInfo:
     var i: Int = start
     while i < end:
         let tk = tokens[i]
-        if tk.kind == MS_TOK_GT or tk.kind == MS_TOK_LT:
-            return CompInfo { has_comp: true, op_kind: tk.kind, op_pos: i }
+        if tk.kind == MS_TOK_NEQ:
+            return CompInfo { has_comp: true, op_kind: MS_TOK_NEQ, op_pos: i, op_len: 1 }
+        if tk.kind == MS_TOK_GT:
+            if i + 1 < end and tokens[i + 1].kind == MS_TOK_EQ:
+                return CompInfo { has_comp: true, op_kind: MS_TOK_GTE, op_pos: i, op_len: 2 }
+            return CompInfo { has_comp: true, op_kind: MS_TOK_GT, op_pos: i, op_len: 1 }
+        if tk.kind == MS_TOK_LT:
+            if i + 1 < end and tokens[i + 1].kind == MS_TOK_EQ:
+                return CompInfo { has_comp: true, op_kind: MS_TOK_LTE, op_pos: i, op_len: 2 }
+            return CompInfo { has_comp: true, op_kind: MS_TOK_LT, op_pos: i, op_len: 1 }
+        if tk.kind == MS_TOK_EQ:
+            if i + 1 < end and tokens[i + 1].kind == MS_TOK_EQ:
+                return CompInfo { has_comp: true, op_kind: MS_TOK_EQ, op_pos: i, op_len: 2 }
         i = i + 1
-    return CompInfo { has_comp: false, op_kind: 0, op_pos: 0 }
+    return CompInfo { has_comp: false, op_kind: 0, op_pos: 0, op_len: 0 }
 
 fn slice_tokens(tokens: Array<MSToken>, start: Int, end: Int) -> Array<MSToken>:
     var result: Array<MSToken> = []
@@ -6812,118 +6913,166 @@ fn slice_tokens(tokens: Array<MSToken>, start: Int, end: Int) -> Array<MSToken>:
     push(result, ms_token_eof())
     return result
 
+// --- Shared condition emitter ------------------------------------------------
+// Emits a condition check + conditional jump(s) taken when FALSE.
+// Returns patch positions to fill with the false-target. Supports ==, !=,
+// <, <=, >, >=; anything else falls back to truthiness (JZ).
+// Jumps use only JN/JZ/JMP: == needs two JN gates (no JNZ opcode exists).
+fn ms_emit_cond_jumps(tokens: Array<MSToken>, cond_end: Int, bc: Array<Int>) -> Array<Int>:
+    var patches: Array<Int> = []
+    let comp = find_comparison(tokens, 1, cond_end)
+    if comp.has_comp:
+        let lhs_end: Int = comp.op_pos
+        let rhs_start: Int = comp.op_pos + comp.op_len
+        if comp.op_kind == MS_TOK_LT:
+            // legacy lowering, preserved exactly: (r-l-1)<0 ⟺ NOT(l<r)
+            let right_tokens = slice_tokens(tokens, rhs_start, cond_end)
+            ms_parse_expr(right_tokens, 0, bc)
+            let left_tokens = slice_tokens(tokens, 1, lhs_end)
+            ms_parse_expr(left_tokens, 0, bc)
+            push(bc, OP_SUB)
+            push(bc, OP_PUSH_STACK)
+            push(bc, 1)
+            push(bc, OP_SUB)
+            push(bc, OP_JN)
+            push(patches, len(bc))
+            push(bc, 0)
+            return patches
+        if comp.op_kind == MS_TOK_GT:
+            // legacy lowering, preserved exactly: (l-r-1)<0 ⟺ NOT(l>r)
+            let left_tokens = slice_tokens(tokens, 1, lhs_end)
+            ms_parse_expr(left_tokens, 0, bc)
+            let right_tokens = slice_tokens(tokens, rhs_start, cond_end)
+            ms_parse_expr(right_tokens, 0, bc)
+            push(bc, OP_SUB)
+            push(bc, OP_PUSH_STACK)
+            push(bc, 1)
+            push(bc, OP_SUB)
+            push(bc, OP_JN)
+            push(patches, len(bc))
+            push(bc, 0)
+            return patches
+        if comp.op_kind == MS_TOK_LTE:
+            // (r-l)<0 ⟺ l>r ⟺ NOT(<=)
+            let right_tokens = slice_tokens(tokens, rhs_start, cond_end)
+            ms_parse_expr(right_tokens, 0, bc)
+            let left_tokens = slice_tokens(tokens, 1, lhs_end)
+            ms_parse_expr(left_tokens, 0, bc)
+            push(bc, OP_SUB)
+            push(bc, OP_JN)
+            push(patches, len(bc))
+            push(bc, 0)
+            return patches
+        if comp.op_kind == MS_TOK_GTE:
+            // (l-r)<0 ⟺ l<r ⟺ NOT(>=)
+            let left_tokens = slice_tokens(tokens, 1, lhs_end)
+            ms_parse_expr(left_tokens, 0, bc)
+            let right_tokens = slice_tokens(tokens, rhs_start, cond_end)
+            ms_parse_expr(right_tokens, 0, bc)
+            push(bc, OP_SUB)
+            push(bc, OP_JN)
+            push(patches, len(bc))
+            push(bc, 0)
+            return patches
+        if comp.op_kind == MS_TOK_NEQ:
+            // SUB is 0 iff equal → jump(else) on equal ⟺ NOT(!=)
+            let left_tokens = slice_tokens(tokens, 1, lhs_end)
+            ms_parse_expr(left_tokens, 0, bc)
+            let right_tokens = slice_tokens(tokens, rhs_start, cond_end)
+            ms_parse_expr(right_tokens, 0, bc)
+            push(bc, OP_SUB)
+            push(bc, OP_JZ)
+            push(patches, len(bc))
+            push(bc, 0)
+            return patches
+        if comp.op_kind == MS_TOK_EQ:
+            // no JNZ opcode: two JN gates (l<r→else, r<l→else), fallthrough ⟺ equal
+            let left_tokens = slice_tokens(tokens, 1, lhs_end)
+            ms_parse_expr(left_tokens, 0, bc)
+            let right_tokens = slice_tokens(tokens, rhs_start, cond_end)
+            ms_parse_expr(right_tokens, 0, bc)
+            push(bc, OP_SUB)
+            push(bc, OP_JN)
+            push(patches, len(bc))
+            push(bc, 0)
+            ms_parse_expr(right_tokens, 0, bc)
+            ms_parse_expr(left_tokens, 0, bc)
+            push(bc, OP_SUB)
+            push(bc, OP_JN)
+            push(patches, len(bc))
+            push(bc, 0)
+            return patches
+    let cond_tokens = slice_tokens(tokens, 1, cond_end)
+    ms_parse_expr(cond_tokens, 0, bc)
+    push(bc, OP_JZ)
+    push(patches, len(bc))
+    push(bc, 0)
+    return patches
+
+fn ms_patch_all(bc: Array<Int>, patches: Array<Int>, target: Int) -> Int:
+    var pi: Int = 0
+    while pi < len(patches):
+        bc[patches[pi]] = target
+        pi = pi + 1
+    return target
+
 // --- While loop compilation ----------------------------------------------
 
 fn ms_parse_while(lines: Array<String>, line_idx: Int, indent: Int, tokens: Array<MSToken>, bc: Array<Int>) -> Int:
     let loop_start = len(bc)
     let cond_end = len(tokens) - 2
 
-    let comp = find_comparison(tokens, 1, cond_end)
-    if comp.has_comp:
-        if comp.op_kind == MS_TOK_LT:
-            let right_tokens = slice_tokens(tokens, comp.op_pos + 1, cond_end)
-            ms_parse_expr(right_tokens, 0, bc)
-            let left_tokens = slice_tokens(tokens, 1, comp.op_pos)
-            ms_parse_expr(left_tokens, 0, bc)
-            push(bc, OP_SUB)
-        else:
-            let left_tokens = slice_tokens(tokens, 1, comp.op_pos)
-            ms_parse_expr(left_tokens, 0, bc)
-            let right_tokens = slice_tokens(tokens, comp.op_pos + 1, cond_end)
-            ms_parse_expr(right_tokens, 0, bc)
-            push(bc, OP_SUB)
-        push(bc, OP_PUSH_STACK)
-        push(bc, 1)
-        push(bc, OP_SUB)
-        push(bc, OP_JN)
-        let jn_patch = len(bc)
-        push(bc, 0)
-        let next_idx = parse_ms_block(lines, line_idx + 1, indent, bc)
-        push(bc, OP_JMP)
-        push(bc, loop_start)
-        bc[jn_patch] = len(bc)
-        return next_idx
-    else:
-        let cond_tokens = slice_tokens(tokens, 1, cond_end)
-        ms_parse_expr(cond_tokens, 0, bc)
-        push(bc, OP_JZ)
-        let jz_patch = len(bc)
-        push(bc, 0)
-        let next_idx = parse_ms_block(lines, line_idx + 1, indent, bc)
-        push(bc, OP_JMP)
-        push(bc, loop_start)
-        bc[jz_patch] = len(bc)
-        return next_idx
+    let patches = ms_emit_cond_jumps(tokens, cond_end, bc)
+    let next_idx = parse_ms_block(lines, line_idx + 1, indent, bc)
+    push(bc, OP_JMP)
+    push(bc, loop_start)
+    let _pw: Int = ms_patch_all(bc, patches, len(bc))
+    return next_idx
 
 // --- If/else compilation -------------------------------------------------
 
 fn ms_parse_if(lines: Array<String>, line_idx: Int, indent: Int, tokens: Array<MSToken>, bc: Array<Int>) -> Int:
     let cond_end = len(tokens) - 2
 
-    let comp = find_comparison(tokens, 1, cond_end)
-    if comp.has_comp:
-        if comp.op_kind == MS_TOK_LT:
-            let right_tokens = slice_tokens(tokens, comp.op_pos + 1, cond_end)
-            ms_parse_expr(right_tokens, 0, bc)
-            let left_tokens = slice_tokens(tokens, 1, comp.op_pos)
-            ms_parse_expr(left_tokens, 0, bc)
-            push(bc, OP_SUB)
-        else:
-            let left_tokens = slice_tokens(tokens, 1, comp.op_pos)
-            ms_parse_expr(left_tokens, 0, bc)
-            let right_tokens = slice_tokens(tokens, comp.op_pos + 1, cond_end)
-            ms_parse_expr(right_tokens, 0, bc)
-            push(bc, OP_SUB)
-        push(bc, OP_PUSH_STACK)
-        push(bc, 1)
-        push(bc, OP_SUB)
-        push(bc, OP_JN)
-        let jn_patch = len(bc)
-        push(bc, 0)
-        var next_idx = parse_ms_block(lines, line_idx + 1, indent, bc)
-        var has_else = false
+    var patches = ms_emit_cond_jumps(tokens, cond_end, bc)
+    var next_idx = parse_ms_block(lines, line_idx + 1, indent, bc)
+    var end_patches: Array<Int> = []
+    // elif chain: each elif closes the previous case and opens a new condition
+    var more: Bool = true
+    while more:
+        more = false
         if next_idx < len(lines):
             let nl = trim_ms(lines[next_idx])
             let ni = count_indent(lines[next_idx])
             if ni == indent:
                 let nt = tokenize_ms_line(nl)
-                if len(nt) > 2 and nt[0].kind == MS_TOK_ELSE and nt[1].kind == MS_TOK_COLON:
-                    has_else = true
-        if has_else:
-            push(bc, OP_JMP)
-            let jmp_patch = len(bc)
-            push(bc, 0)
-            bc[jn_patch] = len(bc)
-            next_idx = parse_ms_block(lines, next_idx + 1, indent, bc)
-            bc[jmp_patch] = len(bc)
-        else:
-            bc[jn_patch] = len(bc)
-        return next_idx
+                if len(nt) > 3 and nt[0].kind == MS_TOK_ELIF and nt[len(nt) - 2].kind == MS_TOK_COLON:
+                    push(bc, OP_JMP)
+                    push(end_patches, len(bc))
+                    push(bc, 0)
+                    let _pp: Int = ms_patch_all(bc, patches, len(bc))
+                    patches = ms_emit_cond_jumps(nt, len(nt) - 2, bc)
+                    next_idx = parse_ms_block(lines, next_idx + 1, indent, bc)
+                    more = true
+    // optional else
+    var has_else: Bool = false
+    if next_idx < len(lines):
+        let nl = trim_ms(lines[next_idx])
+        let ni = count_indent(lines[next_idx])
+        if ni == indent:
+            let nt = tokenize_ms_line(nl)
+            if len(nt) > 2 and nt[0].kind == MS_TOK_ELSE and nt[1].kind == MS_TOK_COLON:
+                has_else = true
+    if has_else:
+        push(bc, OP_JMP)
+        push(end_patches, len(bc))
+        push(bc, 0)
+        let _pe: Int = ms_patch_all(bc, patches, len(bc))
+        next_idx = parse_ms_block(lines, next_idx + 1, indent, bc)
     else:
-        let cond_tokens = slice_tokens(tokens, 1, cond_end)
-        ms_parse_expr(cond_tokens, 0, bc)
-        push(bc, OP_JZ)
-        let jz_patch = len(bc)
-        push(bc, 0)
-        var next_idx = parse_ms_block(lines, line_idx + 1, indent, bc)
-        var has_else = false
-        if next_idx < len(lines):
-            let nl = trim_ms(lines[next_idx])
-            let ni = count_indent(lines[next_idx])
-            if ni == indent:
-                let nt = tokenize_ms_line(nl)
-                if len(nt) > 2 and nt[0].kind == MS_TOK_ELSE and nt[1].kind == MS_TOK_COLON:
-                    has_else = true
-        if has_else:
-            push(bc, OP_JMP)
-            let jmp_patch = len(bc)
-            push(bc, 0)
-            bc[jz_patch] = len(bc)
-            next_idx = parse_ms_block(lines, next_idx + 1, indent, bc)
-            bc[jmp_patch] = len(bc)
-        else:
-            bc[jz_patch] = len(bc)
-        return next_idx
+        let _pf: Int = ms_patch_all(bc, patches, len(bc))
+    let _pend: Int = ms_patch_all(bc, end_patches, len(bc))
+    return next_idx
 
 // --- Block parser (indentation-based) ------------------------------------
 
@@ -8307,6 +8456,7 @@ use parser      // OP_HALT, OP_ENTER_DOMAIN, ... OP_JN (all 21 constants 0-20)
 
 // OP_PUSH_STRING_REF: Int = 24 is now defined in parser.kn (canonical source)
 pub const OP_ERROR_BOUNDARY:  Int = 25   // domain error boundary marker (reserved)
+pub const OP_MOD:             Int = 26   // integer remainder a%b (C truncation; traps on zero like DIV)
 pub const MAX_ERRORS:         Int = 10   // error threshold before graceful halt
 
 // ===========================================================================
@@ -8603,6 +8753,18 @@ fn div_values(a: MarkValue, b: MarkValue) -> MarkValue:
         return mark_float(a.float_val / b.int_val)
     else:
         return mark_int(0)
+
+fn mod_values(a: MarkValue, b: MarkValue) -> MarkValue:
+    // Integer remainder with C truncation semantics: a - (a/b)*b.
+    // Zero divisor traps exactly like div_values (caller checks).
+    if b.kind == MARK_INT and b.int_val == 0:
+        return mark_int(0)  // trap
+    if b.kind == MARK_FLOAT and b.float_val == 0.0:
+        return mark_int(0)  // trap
+    if a.kind == MARK_INT and b.kind == MARK_INT:
+        let q: Int = a.int_val / b.int_val
+        return mark_int(a.int_val - q * b.int_val)
+    return mark_int(0)
 
 fn is_zero_value(v: MarkValue) -> Bool:
     if v.kind == MARK_INT:
@@ -8996,6 +9158,21 @@ pub fn execute_bytecode(vm: MarkScriptVM, bc: Array<Int>) -> ExecResult:
                     push(stk, mark_int(0))
                 else:
                     push(stk, div_values(a, b))
+            ip = ip + 1
+
+        // --- OP_MOD (26) — a % b, trap on zero ----------------------------
+        elif opcode == OP_MOD:
+            let stk_len = len(stk)
+            if stk_len >= 2:
+                let b = pop_stack(stk)
+                let a = pop_stack(stk)
+                if is_zero_divisor(b):
+                    verr = make_error(ERROR_TYPE,
+                        "modulo by zero",
+                        0, "", "")
+                    push(stk, mark_int(0))
+                else:
+                    push(stk, mod_values(a, b))
             ip = ip + 1
 
         // --- OP_LOAD_VAR (18) — lookup variable by hash and push ------------
