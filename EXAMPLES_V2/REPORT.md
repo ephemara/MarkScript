@@ -1,76 +1,83 @@
 # EXAMPLES_V2 — Torture Battery Report
 
-**Exe under test:** `mks-windows-x86_64.exe` (release v1.0.0 asset, built from
-`markscript.kn` in this repo). **Method:** `check` + `run` every file,
-`jit-run` + `jit` where applicable. Asserts are silent on pass — every
-`Handler error` line below is a real failure, every silence is a pass
-(verified by planting known-false asserts: they DO scream).
+**Exe under test:** `mks-windows-x86_64.exe` rebuilt from `markscript.kn`
+in THIS repo (post-fix build). **Method:** `run` every file (build, not
+check, is the reliable gate — see note), `jit-run` + `jit` where applicable.
+Registry (`std/intents.md`) present: without it all intents silently parse
+as prose — if nothing fires at all, check the registry first.
 
-## Results
+> **Corrections to v1 of this report:** early runs lacked the registry, so
+> "silent" verdicts were vacuous. Everything below re-ran WITH registry on
+> the fixed exe. `02_compute_gauntlet` does NOT pass — its asserts fail
+> (F2). Integer math is verified only where in-fence prints show it
+> (fizzbuzz loop/numbers).
 
-| File | check | run | Verdict |
-|---|---|---|---|
-| 01_lexer_torture | PASS | exit 0, **1 dispatch of dozens** | ⚠️ Compiles everything (spec holds: zero syntax errors incl. h7, ragged tables, unicode, unclosed sections) but only one intent fires |
-| 02_compute_gauntlet | PASS | exit 0, **fully silent** | ✅ fib/collatz/primes/triangle/100k-loop asserts ALL pass — VM integer math is CORRECT. Prints never fire (see F3) |
-| 03_intent_storm | PASS | exit 0, **zero dispatches** | ⚠️ No intent fires, no fs side effects created. Same shape as 05 which fires 10 — dispatch scoping undetermined (see F3) |
-| 04_matrix_madness | PASS | exit 0, **1 assert FAILS** | ❌ `matrix_tables != 7` — fence-set var invisible to later intent (see F2) |
-| 05_error_alley | PASS | exit 0, graceful | ✅ Unknown intent, arity error, div-zero, assert-fail, import-fail ALL handled, no crash. Multi-word print args garbled (see F4) |
-| 06_jit_brutal (VM) | PASS | **SEGFAULT 0xC0000005** | ❌❌ 2 assert fails (same F2 pattern) then access violation. Fuzzer-grade find |
-| 06_jit_brutal (jit-run) | — | exit 0, **no execution evidence** | ❌ Compiles to x86-64, then silence. The asserts that fail under VM should fail here — nothing runs |
-| 07_fuzz_corpus | PASS (+2 correct unknown-intent warnings) | exit 0, 4 dispatches, no hang | ✅ Unclosed fence, nested quotes, adversarial nesting all survive. Lexer/parser robust |
-| `jit` selftest | — | all op emitters OK | ✅ JIT backend alive, emits bytes for every op |
-| `repl` | — | canned demo, ignores stdin | ❌ Not scriptable, not interactive without TTY |
-| `eval` | — | "Nothing to execute" (print, assert) | ❌ Stub |
-| `pipe` | — | silent exit 0 (full doc in, nothing out) | ❌ Stub |
+## Results (fixed exe + registry)
 
-## Findings (all reproduced, all in this repo's exe)
+| File | run | Verdict |
+|---|---|---|
+| 01_lexer_torture | exit 0 | ⚠️ Compiles everything (spec holds: zero syntax errors). fence→intent vars fail asserts (F2). Prints now whole (fix B) |
+| 02_compute_gauntlet | exit 0 | ❌ ALL asserts fail (`fa != 832040`…) — F2. Nothing proven about VM math beyond fizzbuzz's loop |
+| 03_intent_storm | exit 0 | ⚠️ Value intents run silent by design; prints/asserts evaluated. fs roundtrip created no files (paths CWD-relative — check CWD) |
+| 04_matrix_madness | exit 0 | ❌ `matrix_tables != 7` — F2 |
+| 05_error_alley | exit 0, graceful | ✅ Unknown intent, arity error, div-zero, assert-fail, import-fail all handled, no crash |
+| 06_jit_brutal (VM) | **SEGFAULT 0xC0000005** | ❌❌ 2 assert fails (F2) then access violation |
+| 06_jit_brutal (jit-run) | exit 0, no execution evidence | ❌ Compiles to x86-64, then silence. Asserts that fail under VM should fail here |
+| 07_fuzz_corpus | exit 0 | ✅ Unclosed fence, nested quotes, adversarial nesting all survive. No crash, no hang |
+| `jit` selftest | all op emitters OK | ✅ JIT backend alive |
+| `repl` / `eval` / `pipe` | canned demo / nothing-to-execute / silent | ❌ Stubs. Files (`run`) are the only working execution path |
 
-**F1 — String constant table broken (`<invalid str_ref>`).** Any string
-literal pushed via `OP_PUSH_STRING_REF` renders `<invalid`. Measured: 74 in
-fizzbuzz, 10 in the repo's own `calculator_suite.md`. Poisons ALL string
-output. Root cause lives in the VM's `str_consts` threading (indices emitted
-by codegen don't match the table at exec). **This is the MarkScript bug —
-not toolchain, not env** (proven: Kain-side integer/string lanes verified
-independently).
+## Fixed in THIS repo's markscript.kn (verified live)
 
-**F2 — Fence→intent variable visibility intermittent.** Identical pattern
-(fence sets var, `> assert` reads it): passes in 02 + probes, fails in 04
-(`matrix_tables`) and 06 (`ja`/`jb`). Suspect: routine/table-count-dependent
-scope or var-slot collision. Needs a one-variable-at-a-time repro.
+**Fix A — string table reseed.** `OP_PUSH_STRING_REF` past index 0 rendered
+`<invalid`: table intact at exec entry (len 3, verified via instrumented
+debug build) but EMPTY on every re-entry — `resume_execution` drops
+`string_constants` threading the VM through dispatch. Fix: reload from the
+parser world table on every re-entry (one line). Result: fizzbuzz prints
+`FizzBuzz`/`Fizz`/`Buzz`, **zero invalids** (was 74).
 
-**F3 — Top-level intent dispatch inconsistent.** Probe matrix: lone `> print`
-never fires; fence+prints never fire; yet 05 fires 10 dispatches and 01 fires
-1. `handler_println` prints `args[0]` ONLY (bridge.kn:722-725) — multi-word
-strings can never print whole by construction.
+**Fix B — print all args.** `handler_println` printed `args[0]` only; intent
+tokenizers split quoted strings, so multi-word strings could never print
+whole. Now space-joins all args. `> print "LEXER TORTURE DONE"` works.
 
-**F4 — Print args garbled.** `> print "divzero row done"` → `[PRINT] divzero`;
-other multi-word prints → `[PRINT] 0`. Bare words resolve as unset vars (→0);
-quoting does not protect spaces. Intent tokenizer suspect.
+## Diagnosed, NOT yet fixed (precise mechanisms, repros included)
 
-**F5 — Segfault after assert failures** (06: exit -1073741819). Error path
-corrupts the VM loop. Highest severity in this report.
+**F2 — fence→intent variable invisibility.** Vars set in ```markscript
+fences read back unset in later `> assert` (`fa != 832040`,
+`matrix_tables != 7`, `qq != 42`). In-fence reads work (fizzbuzz loop).
+Suspect: assert name-resolution vs STORE_VAR hashing. Repro:
+`## r` + fence `let qq = 42` + `> assert qq 42` → fails.
 
-**F6 — `jit-run` compiles, never executes.** No output, no assert failures,
-exit 0 on input that fails loudly under `run`.
+**F3 — `elif` falls through.** The mini-language tokenizer has NO ELIF token
+(`MS_TOK_IF/ELSE` exist, ELIF doesn't) and `ms_parse_if` only looks for
+`ELSE` — elif lines compile as plain statements, bodies run unconditionally.
+Fizzbuzz's 25/25/25/absent split is this bug. Fix needs token + branch
+patching in `ms_parse_if` (~15 lines, needs care).
 
-**F7 — `disasm` and `run` disagree**: 943 vs 414 ops on 02_compute_gauntlet.
-Two different frontends; at least one's count is fiction.
+**F4 — top-level `if/else` ignores conditions.** `if cv%2==0` with cv=5
+takes the if-branch. Disasm shows the condition compiled to bare
+`LOAD cv; JZ` — `find_comparison` doesn't handle `%`-containing LHS, so it
+falls back to truthiness of the first operand. Same family as F3 (expression
+finder gaps). In-loop conditions behave differently — needs a second look.
 
-**F8 — `repl`/`eval`/`pipe` are stubs.** Canned demo / nothing-to-execute /
-silent-exit. Files (`run`) are the only working execution path.
+**F5 — `"0 "` arg prefix.** `> print hello` → `[PRINT] 0 hello`;
+`> print 42` → `[PRINT] 0 42`. A stray count/int leaks from the
+count+bytes stack encoding (`run_handler_loop` pops the WHOLE stack as
+args, including non-arg temporaries). Quoted multi-word strings decode
+clean; bare words don't.
+
+**F6 — segfault after assert failures** (06, `0xC0000005`). Error path
+corrupts the dispatch loop. Highest severity here.
+
+**F7 — `jit-run` compiles, never executes.** No output, exit 0, on input
+that fails loudly under `run`.
+
+**F8 — `repl`/`eval`/`pipe` stubs** (canned demo / nothing-to-execute /
+silent). **F9 — `disasm` vs `run` op counts disagree** (943 vs 414, same
+file). **F10 — `kain check` is not the gate**: 482 namespace-collision
+errors on input `build` compiles cleanly. Build, don't check.
 
 ## Portability note (good news)
 
 No `../std/intents.md` beside the input → exe falls back to 95 embedded
-handlers and runs anyway. V2 files execute from ANY directory. Registry file
-is enhancement, not requirement.
-
-## Repro
-
-```bat
-mks.exe check EXAMPLES_V2\04_matrix_madness.md   :: passes
-mks.exe run   EXAMPLES_V2\04_matrix_madness.md   :: assert matrix_tables fails
-mks.exe run   EXAMPLES_V2\06_jit_brutal.md       :: asserts fail, then SEGFAULT
-mks.exe jit-run EXAMPLES_V2\06_jit_brutal.md     :: silent exit 0 (should fail same asserts)
-echo ... | mks.exe repl                          :: canned demo, stdin ignored
-```
+handlers and runs. Registry file is enhancement, not requirement.

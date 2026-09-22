@@ -772,9 +772,16 @@ fn handler_assert(vm: MarkScriptVM, args: Array<MarkValue>) -> HandlerResult:
 // --- handler_println — "print" intent ------------------------------------
 // args[0] = value to print
 fn handler_println(vm: MarkScriptVM, args: Array<MarkValue>) -> HandlerResult:
+    // Print ALL args space-joined (intent tokenizers split quoted strings).
+    var msg: String = ""
+    var pi: Int = 0
+    while pi < len(args):
+        if pi > 0:
+            msg = msg + " "
+        msg = msg + mark_value_to_string(args[pi])
+        pi = pi + 1
     if len(args) > 0:
-        let val_str = mark_value_to_string(args[0])
-        println("[PRINT] " + val_str)
+        println("[PRINT] " + msg)
     return HandlerResult {
         vm: vm,
         value: mark_int(0),
@@ -9146,6 +9153,11 @@ pub fn execute_bytecode(vm: MarkScriptVM, bc: Array<Int>) -> ExecResult:
 
 pub fn resume_execution(vm: MarkScriptVM, bc: Array<Int>, handler_result: HandlerResult) -> ExecResult:
     var v = handler_result.vm
+    // RESEED: struct threading across dispatch drops string_constants
+    // (exec entry sees len 0 after the first dispatch). The parser world
+    // table is the authority and is stable at exec time — reload it on
+    // every re-entry so string refs stay valid for the whole session.
+    v.string_constants = parser_strings_table()
 
     // Store handler result in the well-known _last variable
     v.last_handler_result = handler_result.value
